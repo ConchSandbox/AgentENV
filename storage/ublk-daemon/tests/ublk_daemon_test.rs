@@ -732,6 +732,11 @@ mod client_tests {
                 },
                 DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
                 DaemonRequest::PrefetchStartupPack { .. } => DaemonResponse::Ok,
+                DaemonRequest::CreateRawBlob { .. }
+                | DaemonRequest::GetRawBlob { .. }
+                | DaemonRequest::DeleteRawBlob { .. } => {
+                    panic!("raw blob request in OverlayBD-only test")
+                }
             }
         }))
         .await;

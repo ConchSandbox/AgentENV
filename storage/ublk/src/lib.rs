@@ -23,7 +23,7 @@ pub use dev::{UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget};
 pub use impls::startup_pack_recorder::{
     tmp_pack_path, FinalizeOutcome, RecordingVerdict, StartupPackReadGuard, StartupPackRecorder,
 };
-pub use impls::{OverlaybdTarget, OverlaybdTargetConfig};
+pub use impls::{OverlaybdTarget, OverlaybdTargetConfig, RawBlobTarget, RawReadMode};
 pub use io_buffer::{AutoRegBuffer, IOBuffer, IOBufferView, UserBuffer};
 use queue::UBLK_QUEUE_URING;
 pub use queue::{UVMUblkQueue, UblkDescOperation};

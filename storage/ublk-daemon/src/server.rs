@@ -28,6 +28,7 @@ use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
     ResizeToolSpec,
 };
+use crate::raw_blob::{RawBlobDevices, RawBlobSpec};
 use crate::runtime;
 
 // ── Managed device wrapper ──────────────────────────────────────────────────
@@ -275,6 +276,7 @@ pub struct UblkDaemonServer {
     image_service_cache: Arc<ImageServiceCache>,
     default_image_service: ImageService,
     devices: Arc<DashMap<u32, ManagedDevice>>,
+    raw_blobs: Arc<RawBlobDevices>,
     pool_state: Option<Arc<PoolState>>,
     resize_tool: Option<ResizeToolSpec>,
     resize_global_config: PathBuf,
@@ -332,6 +334,7 @@ impl UblkDaemonServer {
             image_service_cache: Arc::new(cache),
             default_image_service,
             devices: Arc::new(DashMap::new()),
+            raw_blobs: Arc::new(RawBlobDevices::default()),
             pool_state: None,
             resize_tool: None,
             resize_global_config,
@@ -417,6 +420,7 @@ impl UblkDaemonServer {
                 accept = listener.accept() => {
                     let (stream, _) = accept.context("accept daemon connection")?;
                     let devices = Arc::clone(&self.devices);
+                    let raw_blobs = Arc::clone(&self.raw_blobs);
                     let ctrl_ring = self.ctrl_ring.clone();
                     let image_service_cache = Arc::clone(&self.image_service_cache);
                     let pool_state = self.pool_state.as_ref().map(Arc::clone);
@@ -430,6 +434,7 @@ impl UblkDaemonServer {
                         if let Err(err) = handle_connection(
                             stream,
                             devices,
+                            raw_blobs,
                             ctrl_ring,
                             image_service_cache,
                             pool_state,
@@ -466,6 +471,7 @@ impl UblkDaemonServer {
     }
 
     async fn stop_all_devices(&self) {
+        self.raw_blobs.shutdown(self.ctrl_ring.clone()).await;
         // Abort pack recordings first so a window task cannot finalize into a
         // device that is being stopped, and no tmp pack files survive.
         let recording_ids: Vec<u32> = self.pack_recordings.iter().map(|r| *r.key()).collect();
@@ -552,6 +558,7 @@ impl UblkDaemonServer {
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     devices: Arc<DashMap<u32, ManagedDevice>>,
+    raw_blobs: Arc<RawBlobDevices>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: Arc<ImageServiceCache>,
     pool_state: Option<Arc<PoolState>>,
@@ -567,6 +574,32 @@ async fn handle_connection(
     };
 
     let response = match request {
+        DaemonRequest::CreateRawBlob {
+            device_key,
+            blob_digest,
+            blob_path,
+            blob_url,
+            size_bytes,
+            read_mode,
+        } => {
+            raw_blobs
+                .create(
+                    &device_key,
+                    RawBlobSpec {
+                        blob_digest,
+                        blob_path,
+                        blob_url,
+                        size_bytes,
+                        read_mode,
+                    },
+                    ctrl_ring,
+                )
+                .await
+        }
+        DaemonRequest::GetRawBlob { device_key } => raw_blobs.get(&device_key).await,
+        DaemonRequest::DeleteRawBlob { device_key } => {
+            raw_blobs.delete(&device_key, ctrl_ring).await
+        }
         DaemonRequest::CreateOverlaybd {
             image_config,
             global_config,

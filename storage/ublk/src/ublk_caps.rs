@@ -21,6 +21,13 @@ pub const UBLK_U_CMD_UPDATE_SIZE: u32 = (3 << 30)
 /// the device supports `UBLK_U_CMD_UPDATE_SIZE`.
 pub const UBLK_F_UPDATE_SIZE: u64 = 1 << 10;
 
+/// Required for explicit raw-blob zero-copy modes; never silently omitted.
+pub const UBLK_F_AUTO_BUF_REG: u64 = ublk_sys::UBLK_F_AUTO_BUF_REG as u64;
+
+/// Linux UAPI ublk_cmd.h: suppress automatic partition probing at START_DEV.
+/// Raw memory blobs have no partition table and must not trigger eager reads.
+pub const UBLK_F_NO_AUTO_PART_SCAN: u64 = 1 << 18;
+
 #[cfg(test)]
 mod tests {
     use super::*;

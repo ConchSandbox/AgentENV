@@ -13,7 +13,7 @@ use storage_util::io_ring::AsyncIoRing;
 pub struct UVMUblkDevBuilder<T: UVMUblkTarget> {
     ctrl: UVMUblkCtrl,
     tgt_name: &'static str,
-    tgt: Option<T>,
+    tgt: Option<Arc<T>>,
 }
 
 impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
@@ -26,6 +26,12 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
     }
 
     pub fn set_target(mut self, tgt: T) -> Self {
+        self.tgt = Some(Arc::new(tgt));
+        self
+    }
+
+    /// Keep the target alive in the owner during partial creation cleanup.
+    pub fn set_shared_target(mut self, tgt: Arc<T>) -> Self {
         self.tgt = Some(tgt);
         self
     }
@@ -33,6 +39,12 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
     /// Create the new Ublk device.
     /// It will send ADD command to ublkdrv, to create /dev/ublcX device.
     pub async fn build(self) -> Result<UVMUblkDev<T>> {
+        self.build_tracked(&mut None).await
+    }
+
+    /// Record a successful ADD_DEV before any later fallible initialization.
+    /// The caller must retain this ID until deletion is confirmed on failure.
+    pub async fn build_tracked(self, added_dev_id: &mut Option<u32>) -> Result<UVMUblkDev<T>> {
         let tgt = self.tgt.ok_or_else(|| anyhow!("do not set target"))?;
 
         let mut ctrl = self.ctrl;
@@ -44,6 +56,7 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
         ctrl.add_dev()
             .await
             .context("add dev when build UVMUblkDev")?;
+        *added_dev_id = Some(ctrl.dev_info.dev_id);
         tracing::info!(
             dev_id = ctrl.dev_info.dev_id,
             zero_copy = (ctrl.dev_info.flags & (ublk_sys::UBLK_F_SUPPORT_ZERO_COPY as u64)) != 0,
@@ -86,7 +99,7 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
                 cdev_file: cdev,
                 queue_threads: Mutex::new(vec![]),
             }),
-            tgt: Arc::new(tgt),
+            tgt,
         })
     }
 }
@@ -116,7 +129,12 @@ impl Drop for UVMUblkDevInner {
 impl UVMUblkQueue {
     /// The job for each slot within the queue.
     /// - `tag`: a slot id within the the queue (corresponding to the depth).
-    async fn slot_task<T: UVMUblkTarget>(self: Rc<Self>, tag: u16, tgt: Arc<T>) -> Result<()> {
+    async fn slot_task<T: UVMUblkTarget>(
+        self: Rc<Self>,
+        tag: u16,
+        tgt: Arc<T>,
+        ready: oneshot::Sender<()>,
+    ) -> Result<()> {
         let bufsize = self.dev_info.max_io_buf_bytes;
         let mut buf = if self.is_zero_copy() {
             IOBuffer::AutoReg(
@@ -126,7 +144,7 @@ impl UVMUblkQueue {
             )
         } else {
             IOBuffer::User(
-                UserBuffer::new(self.ring.clone(), bufsize as _, 512)
+                UserBuffer::new(self.ring.clone(), bufsize as _, 4096)
                     .await
                     .context("allocate io user buffer")?,
             )
@@ -134,7 +152,7 @@ impl UVMUblkQueue {
 
         let mut extra = match tgt.per_slot_extra_buf_len() {
             Some(size) if size.is_multiple_of(512) => Some(IOBuffer::User(
-                UserBuffer::new(self.ring.clone(), size, 512)
+                UserBuffer::new(self.ring.clone(), size, 4096)
                     .await
                     .context("allocate extra buffer")?,
             )),
@@ -144,7 +162,10 @@ impl UVMUblkQueue {
             None => None,
         };
         // FIXME: should we handle EINTR?
-        let res = self.prep_slot(tag, &buf).context("prep_slot")?.await;
+        let fetch = self.prep_slot(tag, &buf).context("prep_slot")?;
+        // START_DEV must not wait forever when buffer allocation/registration fails.
+        let _ = ready.send(());
+        let res = fetch.await;
         if res < 0 {
             tracing::debug!(
                 tag,
@@ -201,11 +222,12 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         qid: u16,
         dev_info: ublk_sys::ublksrv_ctrl_dev_info,
         tx: oneshot::Sender<Result<()>>,
+        ready: oneshot::Sender<()>,
     ) -> std::io::Result<()> {
         thread::Builder::new()
             .name(format!("ublk-q-{}-{qid}", dev_info.dev_id))
             .spawn(move || {
-                let res = Self::queue_work(inner, tgt, qid, dev_info);
+                let res = Self::queue_work(inner, tgt, qid, dev_info, ready);
                 let _ = tx.send(res);
             })
             .map(|_| ())
@@ -216,6 +238,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         tgt: Arc<T>,
         qid: u16,
         dev_info: ublk_sys::ublksrv_ctrl_dev_info,
+        ready: oneshot::Sender<()>,
     ) -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -243,11 +266,18 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 .context("init target for uvm ublk queue")?;
             let queue = Rc::new(queue);
             let mut join_set = tokio::task::JoinSet::new();
+            let mut slot_ready = Vec::new();
             for tag in 0..queue.iodepth() as u16 {
                 let tgt = tgt.clone();
                 let queue = queue.clone();
-                join_set.spawn_local(queue.slot_task(tag, tgt));
+                let (ready_tx, ready_rx) = oneshot::channel();
+                slot_ready.push(ready_rx);
+                join_set.spawn_local(queue.slot_task(tag, tgt, ready_tx));
             }
+            for ready_rx in slot_ready {
+                ready_rx.await.context("ublk slot initialization failed")?;
+            }
+            let _ = ready.send(());
             // we only wait for the slot_task, after that, we just drop the runtime and
             // background task, to close the UBLK_QUEUE_URING.
             while let Some(res) = join_set.join_next().await {
@@ -275,20 +305,26 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             u16,
             ublk_sys::ublksrv_ctrl_dev_info,
             oneshot::Sender<Result<()>>,
+            oneshot::Sender<()>,
         ) -> std::io::Result<()>,
-    ) -> Result<()> {
+    ) -> Result<Vec<oneshot::Receiver<()>>> {
         let mut result_rxs = vec![];
+        let mut ready_rxs = vec![];
         for qid in 0..dev_info.nr_hw_queues {
             let (tx, rx) = oneshot::channel();
+            let (ready_tx, ready_rx) = oneshot::channel();
             // NOTE: we create a separate io uring for each queue.
             // I decide to not share one io uring among multiple devices.
             // When I use shared io uring + register ublk char device, it will stucked when
             // DEL_DEV. Since unregister fd only dec the refcount of current rsrc_node in kernel,
             // other devices might hold ref on the rsrc_node (even using different slot in sparse
             // file table), prevening the ublk char devices been put.
-            let spawn_result = spawn_one(inner.clone(), tgt.clone(), qid, dev_info, tx);
+            let spawn_result = spawn_one(inner.clone(), tgt.clone(), qid, dev_info, tx, ready_tx);
             match spawn_result {
-                Ok(()) => result_rxs.push(rx),
+                Ok(()) => {
+                    result_rxs.push(rx);
+                    ready_rxs.push(ready_rx);
+                }
                 Err(err) => {
                     inner.queue_threads.lock().unwrap().extend(result_rxs);
                     tracing::error!(
@@ -314,7 +350,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             }
         }
         inner.queue_threads.lock().unwrap().extend(result_rxs);
-        Ok(())
+        Ok(ready_rxs)
     }
 
     /// Start the ublk device.
@@ -339,12 +375,17 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         };
         tracing::Span::current().record("dev_id", dev_info.dev_id);
         // spawn queue workers
-        Self::spawn_queue_workers(
+        let ready = Self::spawn_queue_workers(
             &self.inner,
             &self.tgt,
             dev_info,
             Self::spawn_queue_worker_thread,
         )?;
+        for queue_ready in ready {
+            queue_ready
+                .await
+                .context("ublk queue initialization failed before START_DEV")?;
+        }
         // start the device, send command to ublkdrv
         {
             self.ctrl
@@ -438,4 +479,71 @@ pub trait UVMUblkTarget: Send + Sync + 'static {
         extra: Option<&mut IOBuffer>,
         io_ring: &AsyncIoRing,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RawBlobTarget, RawReadMode, UVMUblkCtrlBuilder};
+
+    struct InvalidSlotTarget(RawBlobTarget);
+
+    #[async_trait(?Send)]
+    impl UVMUblkTarget for InvalidSlotTarget {
+        const DEV_NAME: &str = "invalid-slot-test";
+        async fn init(&self, _qid: u16, _ring: &AsyncIoRing) -> Result<()> {
+            Ok(())
+        }
+        fn per_slot_extra_buf_len(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn ublk_dev_params(&self, info: &ublk_sys::ublksrv_ctrl_dev_info) -> ublk_sys::ublk_params {
+            self.0.ublk_dev_params(info)
+        }
+        async fn handle_io_request(
+            self: &Arc<Self>,
+            _qid: u16,
+            _tag: u16,
+            _desc: ublk_sys::ublksrv_io_desc,
+            _buf: &mut IOBuffer,
+            _extra: Option<&mut IOBuffer>,
+            _ring: &AsyncIoRing,
+        ) -> i32 {
+            -libc::EIO
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and ublk"]
+    async fn queue_initialization_failure_returns_before_start_dev() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        let target = InvalidSlotTarget(
+            RawBlobTarget::new(file.path(), 4096, RawReadMode::CopyBuffered).unwrap(),
+        );
+        let (ring, _worker) =
+            storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let ctrl = UVMUblkCtrlBuilder::new()
+            .depth(1)
+            .build(ring.clone())
+            .unwrap();
+        let mut added_id = None;
+        let mut dev = UVMUblkDevBuilder::new(ctrl)
+            .set_target(target)
+            .build_tracked(&mut added_id)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), dev.start()).await;
+        assert!(result
+            .expect("startup must not hang on a failed slot")
+            .is_err());
+        dev.ctrl.stop_dev().await.unwrap();
+        dev.wait_for_bg_tasks().await;
+        drop(dev);
+        let mut ctrl = UVMUblkCtrlBuilder::new()
+            .dev_id(added_id.unwrap())
+            .build(ring)
+            .unwrap();
+        ctrl.del_dev().await.unwrap();
+    }
 }

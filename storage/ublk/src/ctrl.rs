@@ -166,6 +166,11 @@ impl<'a> UVMUblkCtrlBuilder<'a> {
         self
     }
 
+    pub fn no_auto_partition_scan(mut self) -> Self {
+        self.ctrl_flags |= ublk_caps::UBLK_F_NO_AUTO_PART_SCAN;
+        self
+    }
+
     /// Later when add device, we try to use exact the `id` as its device id.
     pub fn dev_id(mut self, id: u32) -> Self {
         self.dev_id = id;

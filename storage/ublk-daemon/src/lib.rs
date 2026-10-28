@@ -1,5 +1,6 @@
 pub mod client;
 pub mod protocol;
+mod raw_blob;
 pub(crate) mod runtime;
 pub mod server;
 

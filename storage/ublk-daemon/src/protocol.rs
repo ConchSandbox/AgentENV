@@ -7,6 +7,7 @@ use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+pub use uvm_ublk::RawReadMode;
 
 /// Maximum message size (16 MiB). Protects against corrupt length prefixes.
 const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
@@ -16,6 +17,22 @@ const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    CreateRawBlob {
+        device_key: String,
+        blob_digest: String,
+        #[serde(default)]
+        blob_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_url: Option<String>,
+        size_bytes: u64,
+        read_mode: RawReadMode,
+    },
+    GetRawBlob {
+        device_key: String,
+    },
+    DeleteRawBlob {
+        device_key: String,
+    },
     /// Create a raw overlaybd ublk device from an already-materialized image
     /// config. This does not create runtime upper files or rewrite image.json.
     /// Sandbox rootfs and extra drives should use
@@ -157,6 +174,14 @@ pub enum PackRecordingState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    RawBlobDevice {
+        dev_id: u32,
+        device_path: PathBuf,
+        size_bytes: u64,
+        read_mode: RawReadMode,
+    },
+    RawBlobMissing,
+    RawBlobDeleted,
     DeviceCreated {
         dev_id: u32,
         device_path: PathBuf,
@@ -256,6 +281,65 @@ pub async fn recv_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_blob_wire_contract_all_modes() {
+        for mode in ["copy-buffered", "copy-direct", "zc-buffered", "zc-direct"] {
+            let json = serde_json::json!({"kind": "create_raw_blob", "device_key": "activation-1", "blob_digest": "sha256:trusted", "blob_path": "/content/blob", "size_bytes": 12288, "read_mode": mode});
+            let request: DaemonRequest = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), json);
+            let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+            send_message(&mut sender, &request).await.unwrap();
+            let decoded: DaemonRequest = recv_message(&mut receiver).await.unwrap().unwrap();
+            let DaemonRequest::CreateRawBlob { read_mode, .. } = decoded else {
+                panic!("wrong request");
+            };
+            let response = DaemonResponse::RawBlobDevice {
+                dev_id: 7,
+                device_path: "/dev/ublkb7".into(),
+                size_bytes: 12288,
+                read_mode,
+            };
+            send_message(&mut receiver, &response).await.unwrap();
+            let response: DaemonResponse = recv_message(&mut sender).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                serde_json::json!({"status": "raw_blob_device", "dev_id": 7, "device_path": "/dev/ublkb7", "size_bytes": 12288, "read_mode": mode})
+            );
+        }
+        for kind in ["get_raw_blob", "delete_raw_blob"] {
+            let json = serde_json::json!({"kind": kind, "device_key": "activation-1"});
+            let request: DaemonRequest = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), json);
+        }
+        assert_eq!(
+            serde_json::to_value(DaemonResponse::RawBlobMissing).unwrap(),
+            serde_json::json!({"status": "raw_blob_missing"})
+        );
+        assert_eq!(
+            serde_json::to_value(DaemonResponse::RawBlobDeleted).unwrap(),
+            serde_json::json!({"status": "raw_blob_deleted"})
+        );
+        assert!(serde_json::from_value::<DaemonRequest>(serde_json::json!({"kind": "create_raw_blob", "device_key": "activation-1", "blob_digest": "x", "blob_path": "/blob", "size_bytes": 4096, "read_mode": "auto"})).is_err());
+    }
+
+    #[test]
+    fn raw_blob_remote_url_wire_contract() {
+        let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "kind": "create_raw_blob", "device_key": "remote", "blob_digest": "trusted",
+            "blob_url": "https://example.invalid/blob", "size_bytes": 8192, "read_mode": "copy-buffered"
+        })).unwrap();
+        let DaemonRequest::CreateRawBlob {
+            blob_path,
+            blob_url,
+            ..
+        } = request
+        else {
+            panic!("wrong variant");
+        };
+        assert!(blob_path.as_os_str().is_empty());
+        assert_eq!(blob_url.as_deref(), Some("https://example.invalid/blob"));
+    }
 
     // ── Existing serde round-trip tests ─────────────────────────────────
 
