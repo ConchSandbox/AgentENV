@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{bail, Context, Result};
 use storage_util::io_ring::IoRingHandle;
 use tokio::sync::Mutex;
-use uvm_ublk::{RawBlobTarget, RawReadMode, UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder};
+use uvm_ublk::{
+    RawBlobTarget, RawCache, RawReadMode, UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder,
+};
 
 use crate::protocol::DaemonResponse;
 use crate::runtime::InvalidRequest;
@@ -36,9 +38,9 @@ impl RawBlobSpec {
         }
         match &self.blob_url {
             Some(url) if !url.is_empty() && self.blob_path.as_os_str().is_empty() => {
-                if self.read_mode != RawReadMode::CopyBuffered {
+                if self.read_mode != RawReadMode::CopyDirect {
                     return Err(
-                        InvalidRequest("HTTP raw blobs require copy-buffered mode".into()).into(),
+                        InvalidRequest("HTTP raw blobs require copy-direct mode".into()).into(),
                     );
                 }
             }
@@ -145,9 +147,17 @@ struct Registry {
 #[derive(Default)]
 pub(crate) struct RawBlobDevices {
     registry: StdMutex<Registry>,
+    cache: Option<Arc<RawCache>>,
 }
 
 impl RawBlobDevices {
+    pub(crate) fn with_cache(cache: Arc<RawCache>) -> Self {
+        Self {
+            registry: StdMutex::new(Registry::default()),
+            cache: Some(cache),
+        }
+    }
+
     fn entry(&self, key: &str) -> Result<Arc<Mutex<RawBlobEntry>>> {
         if key.is_empty() {
             return Err(InvalidRequest("raw blob device_key must not be empty".into()).into());
@@ -176,7 +186,15 @@ impl RawBlobDevices {
             bail!("raw blob creation requires keyed cleanup");
         }
         let target = Arc::new(match &spec.blob_url {
-            Some(url) => RawBlobTarget::new_http(url, spec.size_bytes, spec.read_mode)?,
+            Some(url) => RawBlobTarget::new_http(
+                url,
+                spec.size_bytes,
+                spec.read_mode,
+                &spec.blob_digest,
+                self.cache
+                    .clone()
+                    .context("HTTP raw blobs require a configured raw cache")?,
+            )?,
             None => RawBlobTarget::new(&spec.blob_path, spec.size_bytes, spec.read_mode)?,
         });
         let ctrl = UVMUblkCtrlBuilder::new()
@@ -289,21 +307,22 @@ mod tests {
     }
 
     #[test]
-    fn http_source_requires_exclusive_url_and_copy_buffered() {
+    fn http_source_requires_exclusive_url_and_copy_direct() {
         let mut remote = spec();
         remote.blob_url = Some("http://example.invalid/blob".into());
         assert!(remote.validate().is_err());
         remote.blob_path = PathBuf::new();
+        remote.read_mode = RawReadMode::CopyDirect;
         assert!(remote.validate().is_ok());
         for mode in [
-            RawReadMode::CopyDirect,
+            RawReadMode::CopyBuffered,
             RawReadMode::ZcBuffered,
             RawReadMode::ZcDirect,
         ] {
             remote.read_mode = mode;
             assert!(remote.validate().is_err());
         }
-        remote.read_mode = RawReadMode::CopyBuffered;
+        remote.read_mode = RawReadMode::CopyDirect;
         let mut entry = RawBlobEntry::default();
         entry.bind(&remote).unwrap();
         remote.blob_url = Some("http://example.invalid/different".into());

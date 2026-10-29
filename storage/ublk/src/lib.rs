@@ -20,6 +20,9 @@ pub use ctrl::{
     load_ublk_module, ublk_available, ublk_module_loaded, UVMUblkCtrl, UVMUblkCtrlBuilder,
 };
 pub use dev::{UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget};
+pub use impls::raw_cache::{RawCache, RawCacheStats};
+#[cfg(feature = "test-support")]
+pub use impls::raw_cache::RawCacheTestControl;
 pub use impls::startup_pack_recorder::{
     tmp_pack_path, FinalizeOutcome, RecordingVerdict, StartupPackReadGuard, StartupPackRecorder,
 };

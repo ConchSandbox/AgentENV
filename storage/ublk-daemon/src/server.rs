@@ -345,6 +345,11 @@ impl UblkDaemonServer {
         }
     }
 
+    /// Configure the daemon-wide raw range cache before accepting requests.
+    pub fn set_raw_cache(&mut self, cache: Arc<uvm_ublk::RawCache>) {
+        self.raw_blobs = Arc::new(RawBlobDevices::with_cache(cache));
+    }
+
     /// Configure the daemon-local OverlayBD resize tool.
     /// Must be called before `run()`.
     pub fn set_resize_tool(&mut self, resize_tool: ResizeToolSpec) {

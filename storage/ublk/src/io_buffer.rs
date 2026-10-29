@@ -1,9 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use io_uring::{opcode, types};
-use std::alloc::{alloc, dealloc, Layout};
-use std::cell::OnceCell;
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Weak,
+};
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use storage_util::io_ring::AsyncIoRing;
 
@@ -114,12 +120,72 @@ impl AutoRegBuffer {
     }
 }
 
-pub struct UserBufferInner {
+// Allocation ownership is independent of queue-local buffer registration. Only
+// FrozenBuffer crosses threads; the queue cannot mutate a frozen allocation.
+struct AlignedMemory {
     ptr: *mut u8,
     layout: Layout,
-    /// The index within io uring
+    frozen: AtomicBool,
+    reusable: Notify,
+}
+
+// SAFETY: access is confined to the owning queue while mutable. FrozenBuffer
+// publishes immutable bytes with an acquire/release freeze flag, and the owner
+// must wait for the final frozen lease before accessing mutable bytes again.
+unsafe impl Send for AlignedMemory {}
+unsafe impl Sync for AlignedMemory {}
+
+impl Drop for AlignedMemory {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr, self.layout) };
+    }
+}
+
+struct FrozenMemory {
+    memory: Arc<AlignedMemory>,
+    on_release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+impl Drop for FrozenMemory {
+    fn drop(&mut self) {
+        if let Some(release) = self.on_release.take() {
+            release();
+        }
+        self.memory.frozen.store(false, Ordering::Release);
+        self.memory.reusable.notify_waiters();
+    }
+}
+
+/// An immutable lease on one existing slot allocation, never a payload copy.
+#[derive(Clone)]
+pub(crate) struct FrozenBuffer(Arc<FrozenMemory>);
+#[derive(Clone)]
+pub(crate) struct WeakFrozenBuffer(Weak<FrozenMemory>);
+impl FrozenBuffer {
+    pub(crate) fn downgrade(&self) -> WeakFrozenBuffer {
+        WeakFrozenBuffer(Arc::downgrade(&self.0))
+    }
+    pub(crate) fn subslice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(
+            offset <= self.0.memory.layout.size() && len <= self.0.memory.layout.size() - offset
+        );
+        unsafe { std::slice::from_raw_parts(self.0.memory.ptr.add(offset), len) }
+    }
+}
+impl WeakFrozenBuffer {
+    pub(crate) fn upgrade(&self) -> Option<FrozenBuffer> {
+        self.0.upgrade().map(FrozenBuffer)
+    }
+    pub(crate) fn is_expired(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+}
+
+pub struct UserBufferInner {
+    memory: Arc<AlignedMemory>,
     buf_idx: OnceCell<u32>,
     pub ring: AsyncIoRing,
+    frozen_pin: RefCell<Option<FrozenBuffer>>,
+    request_received: Cell<Instant>,
 }
 
 impl UserBufferInner {
@@ -128,15 +194,21 @@ impl UserBufferInner {
         if layout.size() == 0 {
             bail!("UserBufferInner size cannot be zero");
         }
-        let ptr = unsafe { alloc(layout) };
+        let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             bail!("allocate UserBufferInner failed, size = {size} align = {align}");
         }
         let mut this = Self {
-            ptr,
-            layout,
+            memory: Arc::new(AlignedMemory {
+                ptr,
+                layout,
+                frozen: AtomicBool::new(false),
+                reusable: Notify::new(),
+            }),
             buf_idx: OnceCell::new(),
             ring: ring.clone(),
+            frozen_pin: RefCell::new(None),
+            request_received: Cell::new(Instant::now()),
         };
         // register the buffer to io ring
         let idx = ring.register_buffer(this.as_mut())?;
@@ -160,8 +232,12 @@ impl UserBufferInner {
             offset + len <= self.len(),
             "offset {offset} len = {len} out of range"
         );
+        assert!(
+            !self.memory.frozen.load(Ordering::Acquire),
+            "slot buffer is still frozen"
+        );
         unsafe {
-            let ptr = self.ptr.add(offset);
+            let ptr = self.memory.ptr.add(offset);
             std::slice::from_raw_parts_mut(ptr, len)
         }
     }
@@ -181,23 +257,20 @@ impl UserBufferInner {
             "offset {offset} len = {len} out of range"
         );
         unsafe {
-            let ptr = self.ptr.add(offset);
+            let ptr = self.memory.ptr.add(offset);
             std::slice::from_raw_parts(ptr as _, len)
         }
     }
 
     pub fn len(&self) -> usize {
-        self.layout.size()
+        self.memory.layout.size()
     }
 }
 
 impl Drop for UserBufferInner {
     fn drop(&mut self) {
-        if self.layout.size() != 0 {
-            unsafe {
-                dealloc(self.ptr, self.layout);
-            }
-        }
+        // Unregister before releasing the allocation. Cache I/O uses ordinary
+        // Read/Write SQEs and retains FrozenBuffer, never a registered index.
         if let Some(buf_idx) = self.buf_idx.get().cloned() {
             let _ = self.ring.unregister_buffer(buf_idx);
         }
@@ -206,7 +279,7 @@ impl Drop for UserBufferInner {
 
 impl AsMut<[u8]> for UserBufferInner {
     fn as_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
+        self.subslice_mut(0, self.len())
     }
 }
 
@@ -222,6 +295,41 @@ impl UserBuffer {
         Ok(Self {
             inner: Rc::new(inner),
         })
+    }
+
+    pub(crate) fn freeze(
+        &mut self,
+        on_release: impl FnOnce() + Send + Sync + 'static,
+    ) -> FrozenBuffer {
+        assert_eq!(
+            Rc::strong_count(&self.inner),
+            1,
+            "cannot freeze a split buffer"
+        );
+        assert!(!self.inner.memory.frozen.swap(true, Ordering::AcqRel));
+        let frozen = FrozenBuffer(Arc::new(FrozenMemory {
+            memory: self.inner.memory.clone(),
+            on_release: Some(Box::new(on_release)),
+        }));
+        *self.inner.frozen_pin.borrow_mut() = Some(frozen.clone());
+        frozen
+    }
+
+    pub(crate) async fn wait_reusable(&self) {
+        self.inner.frozen_pin.borrow_mut().take();
+        loop {
+            let notified = self.inner.memory.reusable.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.inner.memory.frozen.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn request_received(&self) -> Instant {
+        self.inner.request_received.get()
     }
 
     /// Return a **mutable** sub slice started from `offset`, and len = `len`.
@@ -273,11 +381,15 @@ impl UserBuffer {
         len: usize,
         buf_offset: u64,
     ) -> std::io::Result<usize> {
+        assert!(
+            !self.inner.memory.frozen.load(Ordering::Acquire),
+            "slot buffer is still frozen"
+        );
         let mut done = 0;
         while done < len {
             let entry = opcode::ReadFixed::new(
                 types::Fixed(io_ring_file_idx),
-                self.inner.ptr.add(buf_offset as usize + done),
+                self.inner.memory.ptr.add(buf_offset as usize + done),
                 (len - done) as _,
                 self.uring_buf_idx(),
             )
@@ -312,7 +424,7 @@ impl UserBuffer {
         while done < len {
             let entry = opcode::WriteFixed::new(
                 types::Fixed(io_ring_file_idx),
-                self.inner.ptr.add(buf_offset as usize + done),
+                self.inner.memory.ptr.add(buf_offset as usize + done),
                 (len - done) as _,
                 self.uring_buf_idx(),
             )
@@ -361,6 +473,18 @@ pub struct IOBufferView {
 }
 
 impl IOBuffer {
+    pub(crate) fn mark_request_received(&self) {
+        if let Self::User(user) = self {
+            user.inner.request_received.set(Instant::now());
+        }
+    }
+
+    pub(crate) async fn wait_reusable(&self) {
+        if let Self::User(user) = self {
+            user.wait_reusable().await;
+        }
+    }
+
     pub fn uring_buf_idx(&self) -> u16 {
         match self {
             IOBuffer::AutoReg(auto_buf) => auto_buf.inner.data.index,
@@ -384,9 +508,15 @@ impl IOBuffer {
             IOBuffer::AutoReg(auto_buf) => IOBuffer::AutoReg(AutoRegBuffer {
                 inner: auto_buf.inner.clone(),
             }),
-            IOBuffer::User(user_buf) => IOBuffer::User(UserBuffer {
-                inner: user_buf.inner.clone(),
-            }),
+            IOBuffer::User(user_buf) => {
+                assert!(
+                    !user_buf.inner.memory.frozen.load(Ordering::Acquire),
+                    "cannot split a frozen buffer"
+                );
+                IOBuffer::User(UserBuffer {
+                    inner: user_buf.inner.clone(),
+                })
+            }
         }
     }
 
@@ -513,5 +643,51 @@ impl IOBufferView {
                     .await
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_lease_crosses_threads_without_copying_or_retaining_a_ring() {
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        unsafe {
+            *ptr = 73;
+        }
+        let memory = Arc::new(AlignedMemory {
+            ptr,
+            layout,
+            frozen: AtomicBool::new(true),
+            reusable: Notify::new(),
+        });
+        let released = Arc::new(AtomicBool::new(false));
+        let callback_ran = released.clone();
+        let frozen_memory = memory.clone();
+        let frozen = FrozenBuffer(Arc::new(FrozenMemory {
+            memory: memory.clone(),
+            on_release: Some(Box::new(move || {
+                assert!(frozen_memory.frozen.load(Ordering::Acquire));
+                callback_ran.store(true, Ordering::Release);
+            })),
+        }));
+        let weak = frozen.downgrade();
+        let address = ptr as usize;
+        let reader = weak.upgrade().unwrap();
+        drop(frozen);
+        assert!(memory.frozen.load(Ordering::Acquire));
+        std::thread::spawn(move || {
+            assert_eq!(reader.subslice(0, 1).as_ptr() as usize, address);
+            assert_eq!(reader.subslice(0, 1), [73]);
+        })
+        .join()
+        .unwrap();
+        assert!(!memory.frozen.load(Ordering::Acquire));
+        assert!(released.load(Ordering::Acquire));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&memory), 1);
     }
 }

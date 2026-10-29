@@ -1,6 +1,7 @@
 mod overlaybd_target;
 mod raw_blob_http;
 pub mod raw_blob_target;
+pub mod raw_cache;
 pub mod startup_pack_recorder;
 
 pub use overlaybd_target::{OverlaybdTarget, OverlaybdTargetConfig};

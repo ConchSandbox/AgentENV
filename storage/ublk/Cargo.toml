@@ -3,6 +3,9 @@ name = "uvm-ublk"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-support = []
+
 [dependencies]
 storage-util = { path = "../util", features = ["io-uring"] }
 overlaybd = { path = "../overlaybd", features = ["io-uring"] }

@@ -15,7 +15,12 @@ pub(super) struct HttpRangeSource {
 impl HttpRangeSource {
     pub(super) fn new(url: &str, size_bytes: u64) -> Result<Self> {
         let url = Url::parse(url).context("invalid raw blob URL")?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
             bail!("raw blob URL must use HTTP or HTTPS and include a host");
         }
         let client = Client::builder()
@@ -43,15 +48,18 @@ impl HttpRangeSource {
         if dst.is_empty() || dst.len() > RAW_BLOB_MAX_IO_BYTES as usize || end > self.size_bytes {
             bail!("raw blob HTTP range exceeds request or object bounds");
         }
-        let mut response = self
-            .client
-            .get(self.url.clone())
-            .header(header::RANGE, format!("bytes={offset}-{}", end - 1))
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context("request raw blob range")?;
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.client
+                .get(self.url.clone())
+                .header(header::RANGE, format!("bytes={offset}-{}", end - 1))
+                .header(header::ACCEPT_ENCODING, "identity")
+                .send(),
+        )
+        .await
+        .context("raw blob response headers timed out")?
+        .map_err(reqwest::Error::without_url)
+        .context("request raw blob range")?;
         if response.status() != StatusCode::PARTIAL_CONTENT {
             bail!(
                 "raw blob range returned HTTP {} instead of 206",

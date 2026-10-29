@@ -179,6 +179,7 @@ impl UVMUblkQueue {
             );
         }
 
+        buf.mark_request_received();
         loop {
             let io_desc = self
                 .io_desc(tag)
@@ -194,10 +195,21 @@ impl UVMUblkQueue {
                     &self.ring,
                 )
                 .await;
-            let res = self
-                .submit_and_fetch_for_slot(tag, &buf, res)
-                .context("submit and fetch from ring")?
-                .await;
+            // COMMIT completes the old READ before FETCH returns a new one.
+            // Cache writers run independently on this LocalSet. Never use the
+            // old READ deadline to cancel COMMIT_AND_FETCH.
+            let next = self.submit_and_fetch_for_slot(tag, &buf, res);
+            let res = match next {
+                Ok(fetch) => fetch.await,
+                Err(error) => {
+                    buf.wait_reusable().await;
+                    return Err(error).context("submit and fetch from ring");
+                }
+            };
+            buf.mark_request_received();
+            // FETCH confirms the old kernel copy has stopped accessing T. A
+            // new READ may already be waiting, but cannot overwrite leases.
+            buf.wait_reusable().await;
             // FIXME: should we handle EINTR?
             if res < 0 {
                 tracing::debug!(

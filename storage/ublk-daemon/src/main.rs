@@ -38,6 +38,14 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// Exclusive directory for remote raw blob direct-I/O cache files.
+    #[arg(long, requires = "raw_cache_bytes")]
+    raw_cache_dir: Option<PathBuf>,
+
+    /// Raw cache data and reservation budget, >= 256 KiB and 4096 aligned.
+    #[arg(long, requires = "raw_cache_dir")]
+    raw_cache_bytes: Option<u64>,
+
     /// Log level: off, error, warn, info, debug, trace.
     #[arg(long, default_value = "info")]
     log_level: LevelFilter,
@@ -257,6 +265,12 @@ fn main() -> Result<()> {
 
     uvm_ublk::setup_tracing(cli.log_file.clone(), cli.log_level).context("setup tracing")?;
 
+    let raw_cache = match (&cli.raw_cache_dir, cli.raw_cache_bytes) {
+        (Some(path), Some(bytes)) => Some(uvm_ublk::RawCache::new(path, bytes)?),
+        (None, None) => None,
+        _ => anyhow::bail!("raw cache directory and capacity must be configured together"),
+    };
+
     // Capture the parent PID before entering the async runtime so
     // getppid() is called on the main thread where the value is reliable.
     let parent_pid = nix::unistd::getppid();
@@ -302,6 +316,9 @@ fn main() -> Result<()> {
             cli.resize_global_config.clone(),
             cli.p2p_publish_url.clone(),
         );
+        if let Some(cache) = raw_cache {
+            server.set_raw_cache(cache);
+        }
         let daemon_config =
             load_daemon_config(cli.config.as_ref()).context("load daemon config")?;
         if let Some(resize_tool) =

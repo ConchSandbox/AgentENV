@@ -10,7 +10,9 @@ use std::sync::Arc;
 use storage_util::io_ring::AsyncIoRing;
 
 use super::raw_blob_http::HttpRangeSource;
+use super::raw_cache::{CacheLayer, RawCache, ReadStep};
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
+use tokio::time::{Duration, Instant};
 
 pub const RAW_BLOB_BLOCK_SIZE: u64 = 4096;
 pub const RAW_BLOB_MAX_IO_BYTES: u32 = 256 * 1024;
@@ -44,7 +46,11 @@ pub struct RawBlobTarget {
 
 enum RawBlobSource {
     Local(File),
-    Http(HttpRangeSource),
+    Http {
+        source: HttpRangeSource,
+        cache: Arc<RawCache>,
+        layer: Arc<CacheLayer>,
+    },
 }
 
 impl RawBlobTarget {
@@ -74,16 +80,85 @@ impl RawBlobTarget {
     }
 
     /// Construct a remote target without downloading header, index, or payload.
-    pub fn new_http(url: &str, size_bytes: u64, read_mode: RawReadMode) -> Result<Self> {
+    pub fn new_http(
+        url: &str,
+        size_bytes: u64,
+        read_mode: RawReadMode,
+        digest: &str,
+        cache: Arc<RawCache>,
+    ) -> Result<Self> {
         validate_size(size_bytes)?;
-        if read_mode != RawReadMode::CopyBuffered {
-            bail!("HTTP raw blobs require copy-buffered mode");
+        if read_mode != RawReadMode::CopyDirect {
+            bail!("HTTP raw blobs require copy-direct mode");
         }
+        let source = HttpRangeSource::new(url, size_bytes)?;
+        let layer = cache.layer(digest, size_bytes)?;
         Ok(Self {
-            source: RawBlobSource::Http(HttpRangeSource::new(url, size_bytes)?),
+            source: RawBlobSource::Http {
+                source,
+                cache,
+                layer,
+            },
             size_bytes,
             read_mode,
         })
+    }
+
+    async fn read_remote(
+        source: &HttpRangeSource,
+        cache: &Arc<RawCache>,
+        layer: &Arc<CacheLayer>,
+        offset: u64,
+        len: usize,
+        user: &mut crate::UserBuffer,
+        ring: &AsyncIoRing,
+    ) -> Result<()> {
+        // One deadline covers cache waits, every HTTP subrange, and cache reads.
+        // It does not cover background writes or waiting for the next FETCH.
+        let deadline = user.request_received() + Duration::from_secs(30);
+        let mut done = 0;
+        let mut claims = Vec::new();
+        while done < len {
+            if Instant::now() >= deadline {
+                bail!("raw blob data supply timed out");
+            }
+            match cache.next(layer, offset + done as u64, len - done) {
+                ReadStep::Disk(borrow) => {
+                    borrow
+                        .read(user.subslice_mut(done as u64, borrow.len), ring, deadline)
+                        .await?;
+                    done += borrow.len;
+                }
+                ReadStep::Ready(buffer, at) => {
+                    user.subslice_mut(done as u64, 4096)
+                        .copy_from_slice(buffer.subslice(at, 4096));
+                    done += 4096;
+                }
+                ReadStep::Wait(mut changed) => {
+                    let _ = tokio::time::timeout_at(deadline, changed.changed())
+                        .await
+                        .context("wait for shared raw blob data")?;
+                }
+                ReadStep::Missing(mut claim) => {
+                    claim.buffer_offset = done;
+                    tokio::time::timeout_at(
+                        deadline,
+                        source.read(claim.offset, user.subslice_mut(done as u64, claim.len)),
+                    )
+                    .await
+                    .context("raw blob data supply timed out")??;
+                    done += claim.len;
+                    claims.push(claim);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("raw blob data supply timed out");
+        }
+        if !claims.is_empty() {
+            cache.publish(claims, user, ring.clone());
+        }
+        Ok(())
     }
 
     fn read_range(&self, desc: ublk_sys::ublksrv_io_desc) -> Result<(u64, usize), i32> {
@@ -110,13 +185,21 @@ impl RawBlobTarget {
         }
         let file = match &self.source {
             RawBlobSource::Local(file) => file,
-            RawBlobSource::Http(source) => {
+            RawBlobSource::Http {
+                source,
+                cache,
+                layer,
+            } => {
                 let IOBuffer::User(user) = buf else {
                     return -libc::EINVAL;
                 };
-                return match source.read(offset, user.subslice_mut(0, len)).await {
+                return match Self::read_remote(source, cache, layer, offset, len, user, ring).await
+                {
                     Ok(()) => len as i32,
-                    Err(_) => -libc::EIO,
+                    Err(error) => {
+                        tracing::warn!(error = %error, offset, len, "raw blob data supply failed");
+                        -libc::EIO
+                    }
                 };
             }
         };
@@ -181,7 +264,7 @@ fn validate_dio_alignment(mask: u32, memory: u32, offset: u32) -> Result<()> {
     Ok(())
 }
 
-fn validate_file_dio_alignment(file: &File) -> Result<()> {
+pub(crate) fn validate_file_dio_alignment(file: &File) -> Result<()> {
     let mut stat: libc::statx = unsafe { std::mem::zeroed() };
     let result = unsafe {
         libc::statx(
@@ -325,18 +408,6 @@ mod tests {
         let fifo = directory.path().join("fifo");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
         assert!(RawBlobTarget::new(&fifo, 4096, RawReadMode::CopyBuffered).is_err());
-    }
-
-    #[test]
-    fn remote_modes_and_schemes_are_explicit() {
-        for mode in [
-            RawReadMode::CopyDirect,
-            RawReadMode::ZcBuffered,
-            RawReadMode::ZcDirect,
-        ] {
-            assert!(RawBlobTarget::new_http("https://example.invalid/blob", 4096, mode).is_err());
-        }
-        assert!(RawBlobTarget::new_http("file:///blob", 4096, RawReadMode::CopyBuffered).is_err());
     }
 
     #[test]
