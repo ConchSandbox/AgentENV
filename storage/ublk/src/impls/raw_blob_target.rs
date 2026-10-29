@@ -135,6 +135,8 @@ impl RawBlobTarget {
                     done += 4096;
                 }
                 ReadStep::Wait(mut changed) => {
+                    // Notification and sender removal both require re-querying
+                    // authoritative range state; neither implies data readiness.
                     let _ = tokio::time::timeout_at(deadline, changed.changed())
                         .await
                         .context("wait for shared raw blob data")?;

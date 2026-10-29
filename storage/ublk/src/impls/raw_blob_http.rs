@@ -177,7 +177,7 @@ mod tests {
             let error = source.read(4096, &mut dst).await.unwrap_err();
             assert!(!format!("{error:#}").contains("do-not-log"));
             assert_eq!(requests.lock().unwrap().len(), 1, "must not retry or follow redirects");
-            assert!(dst.iter().any(|b| *b == 99), "must not fill missing bytes with zeros");
+            assert!(dst.contains(&99), "must not fill missing bytes with zeros");
             task.abort();
         }
     }
