@@ -56,6 +56,17 @@ async fn server(
     tokio::task::JoinHandle<anyhow::Result<()>>,
     PathBuf,
 ) {
+    server_with_cache(dir, None).await
+}
+
+async fn server_with_cache(
+    dir: &Path,
+    cache: Option<Arc<uvm_ublk::RawCache>>,
+) -> (
+    Arc<UblkDaemonServer>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    PathBuf,
+) {
     let global = dir.join("global.json");
     std::fs::write(
         &global,
@@ -69,12 +80,11 @@ async fn server(
     let image_service = ImageService::from_config_path(&global).await.unwrap();
     let (ring, _worker) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
     let socket = dir.join("daemon.sock");
-    let server = Arc::new(UblkDaemonServer::new(
-        socket.clone(),
-        ring,
-        image_service,
-        "/dev/null".into(),
-    ));
+    let mut server = UblkDaemonServer::new(socket.clone(), ring, image_service, "/dev/null".into());
+    if let Some(cache) = cache {
+        server.set_raw_cache(cache);
+    }
+    let server = Arc::new(server);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let runner = Arc::clone(&server);
     let task = tokio::spawn(async move {
@@ -347,8 +357,12 @@ async fn http_device_case(require_no_external_probes: bool) {
             stream.write_all(&http_data[start..=end]).await.unwrap();
         }
     });
-    let dir = tempfile::tempdir().unwrap();
-    let (server, task, socket) = server(dir.path()).await;
+    let base = std::env::var_os("RAW_BLOB_TEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let cache = uvm_ublk::RawCache::new(&dir.path().join("ram"), 256 * 1024).unwrap();
+    let (server, task, socket) = server_with_cache(dir.path(), Some(cache)).await;
     let key = "remote-activation".to_owned();
     let response = rpc(
         &socket,
@@ -358,7 +372,7 @@ async fn http_device_case(require_no_external_probes: bool) {
             blob_path: PathBuf::new(),
             blob_url: Some(url),
             size_bytes: data.len() as u64,
-            read_mode: RawReadMode::CopyBuffered,
+            read_mode: RawReadMode::CopyDirect,
         },
     )
     .await;
@@ -404,9 +418,14 @@ async fn http_device_case(require_no_external_probes: bool) {
             offsets.map(|offset| (offset, offset + 4095))
         );
     } else {
-        // External host probes are separate readers, not source read amplification.
+        // Existing host probes can have cached a larger range before our read.
+        // Each requested byte must still have come from an exact HTTP range.
         for offset in offsets {
-            assert!(requests.lock().unwrap().contains(&(offset, offset + 4095)));
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(start, end)| start <= offset && end >= offset + 4095));
         }
     }
     buffer.bytes().fill(99);
